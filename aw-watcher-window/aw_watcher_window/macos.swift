@@ -1,0 +1,751 @@
+import Cocoa
+import ScriptingBridge
+
+@objc protocol ChromeTab {
+  @objc optional var URL: String { get }
+  @objc optional var title: String { get }
+}
+
+@objc protocol ChromeWindow {
+  @objc optional var activeTab: ChromeTab { get }
+  @objc optional var mode: String { get }
+}
+
+extension SBObject: ChromeWindow, ChromeTab {}
+
+@objc protocol ChromeProtocol {
+  @objc optional func windows() -> [ChromeWindow]
+}
+
+extension SBApplication: ChromeProtocol {}
+
+// https://github.com/tingraldi/SwiftScripting/blob/4346eba0f47e806943601f5fb2fe978e2066b310/Frameworks/SafariScripting/SafariScripting/Safari.swift#L37
+
+@objc public protocol SafariDocument {
+    @objc optional var name: String { get } // Its name.
+    @objc optional var modified: Bool { get } // Has it been modified since the last save?
+    @objc optional var file: URL { get } // Its location on disk, if it has one.
+    @objc optional var source: String { get } // The HTML source of the web page currently loaded in the document.
+    @objc optional var URL: String { get } // The current URL of the document.
+    @objc optional var text: String { get } // The text of the web page currently loaded in the document. Modifications to text aren't reflected on the web page.
+    @objc optional func setURL(_ URL: String!) // The current URL of the document.
+}
+
+@objc public protocol SafariTab {
+    @objc optional var source: String { get } // The HTML source of the web page currently loaded in the tab.
+    @objc optional var URL: String { get } // The current URL of the tab.
+    @objc optional var index: NSNumber { get } // The index of the tab, ordered left to right.
+    @objc optional var text: String { get } // The text of the web page currently loaded in the tab. Modifications to text aren't reflected on the web page.
+    @objc optional var visible: Bool { get } // Whether the tab is currently visible.
+    @objc optional var name: String { get } // The name of the tab.
+    @objc optional func setURL(_ URL: String!) // The current URL of the tab.
+}
+
+@objc public protocol SafariWindow {
+    @objc optional var name: String { get } // The title of the window.
+    @objc optional func id() -> Int // The unique identifier of the window.
+    @objc optional var index: Int { get } // The index of the window, ordered front to back.
+    @objc optional var document: SafariDocument { get } // The document whose contents are displayed in the window.
+    @objc optional func tabs() -> SBElementArray
+    @objc optional var currentTab: SafariTab { get } // The current tab.
+}
+extension SBObject: SafariWindow {}
+
+@objc public protocol SafariApplication {
+    @objc optional func documents() -> SBElementArray
+    @objc optional func windows() -> [SafariWindow]
+    @objc optional var name: String { get } // The name of the application.
+    @objc optional var frontmost: Bool { get } // Is this the active application?
+}
+extension SBApplication: SafariApplication {}
+
+// AW-specific structs
+
+struct NetworkMessage: Codable, Equatable {
+  var app: String
+  var title: String?
+  var url: String?
+}
+
+struct Heartbeat: Codable {
+  var timestamp: Date
+  var data: NetworkMessage
+}
+
+enum HeartbeatError: Error {
+  case error(msg: String)
+}
+
+struct Bucket: Codable {
+  var client: String
+  var type: String
+  var hostname: String
+}
+
+// there's no builtin logging library on macos which has levels & hits stdout, so we build our own simple one
+// there a complex open source one, but it makes it harder to compile this simple one-file swift application
+let dateFormatter =  DateFormatter();
+
+func logTimestamp() -> String {
+  let now = Date()
+  dateFormatter.timeZone = TimeZone.current
+  dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+  return dateFormatter.string(from: now)
+}
+
+// generate log prefix based on level
+func logPrefix(_ level: String) -> String {
+  return "\(logTimestamp()) [aw-watcher-window-macos] [\(level)]"
+}
+
+let logLevel = ProcessInfo.processInfo.environment["LOG_LEVEL"]?.uppercased() ?? "INFO"
+
+func debug(_ msg: String) {
+  if (logLevel == "DEBUG") {
+    print("\(logPrefix("DEBUG")) \(msg)")
+    fflush(stdout)
+  }
+}
+
+func log(_ msg: String) {
+  print("\(logPrefix("INFO")) \(msg)")
+  fflush(stdout)
+}
+
+func error(_ msg: String) {
+  print("\(logPrefix("ERROR")) \(msg)")
+  fflush(stdout)
+}
+
+// Placeholder values, set in start() from CLI arguments
+var baseurl = "http://localhost:5600"
+// NOTE: this differs from the hostname we get from Python, here we get `.local`, but in Python we get `.localdomain`
+var clientHostname = ProcessInfo.processInfo.hostName
+var clientName = "aw-watcher-window"
+var bucketName = "\(clientName)_\(clientHostname)"
+var excludeTitle = false
+var excludeTitlePatterns: [NSRegularExpression] = []
+var researchEnabled = false
+var researchCategoryMap: [(pattern: String, category: String)] = []
+var researchAppCategoryMap: [(app: String, category: String)] = []
+
+let researchBrowserApps = Set([
+  "chrome",
+  "google chrome",
+  "google chrome canary",
+  "google-chrome",
+  "google-chrome-beta",
+  "google-chrome-unstable",
+  "chromium",
+  "chromium-browser",
+  "chromium.exe",
+  "brave browser",
+  "brave",
+  "brave-browser",
+  "arc",
+  "arc browser",
+  "firefox",
+  "firefox developer edition",
+  "firefox-esr",
+  "safari",
+  "edge",
+  "microsoft edge",
+  "microsoft-edge",
+  "microsoft-edge-beta",
+  "microsoft-edge-dev",
+  "opera",
+  "vivaldi",
+  "vivaldi.exe",
+  "chrome.exe",
+  "brave.exe",
+  "firefox.exe",
+  "msedge.exe",
+  "opera.exe",
+])
+
+let main = MainThing()
+var oldHeartbeat: Heartbeat?
+
+let encoder = JSONEncoder()
+let formatter = ISO8601DateFormatter()
+formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+
+encoder.dateEncodingStrategy = .custom({ date, encoder in
+  var container = encoder.singleValueContainer()
+  let dateString = formatter.string(from: date)
+  try container.encode(dateString)
+})
+
+start()
+RunLoop.main.run()
+
+func compileExcludeTitlePattern(_ pattern: String) -> NSRegularExpression {
+  do {
+    return try NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
+  } catch let regexError {
+    error("Invalid regex pattern: \(pattern) — \(regexError.localizedDescription)")
+    exit(1)
+  }
+}
+
+func parseOptionalArguments(_ arguments: ArraySlice<String>) {
+  var index = arguments.startIndex
+  while index < arguments.endIndex {
+    let argument = arguments[index]
+
+    if argument == "--exclude-title" {
+      excludeTitle = true
+      index = arguments.index(after: index)
+      continue
+    }
+
+    if argument == "--exclude-titles" {
+      let nextIndex = arguments.index(after: index)
+      guard nextIndex < arguments.endIndex else {
+        error("Missing value for --exclude-titles")
+        exit(1)
+      }
+      excludeTitlePatterns.append(compileExcludeTitlePattern(arguments[nextIndex]))
+      index = arguments.index(after: nextIndex)
+      continue
+    }
+
+    if argument == "--research" {
+      researchEnabled = true
+      index = arguments.index(after: index)
+      continue
+    }
+
+    if argument == "--research-category" {
+      let patternIndex = arguments.index(after: index)
+      let categoryIndex = patternIndex < arguments.endIndex ? arguments.index(after: patternIndex) : arguments.endIndex
+      guard patternIndex < arguments.endIndex, categoryIndex < arguments.endIndex else {
+        error("Missing pattern/category values for --research-category")
+        exit(1)
+      }
+      researchCategoryMap.append((pattern: arguments[patternIndex], category: arguments[categoryIndex]))
+      index = arguments.index(after: categoryIndex)
+      continue
+    }
+
+    if argument == "--research-app-category" {
+      let appIndex = arguments.index(after: index)
+      let categoryIndex = appIndex < arguments.endIndex ? arguments.index(after: appIndex) : arguments.endIndex
+      guard appIndex < arguments.endIndex, categoryIndex < arguments.endIndex else {
+        error("Missing app/category values for --research-app-category")
+        exit(1)
+      }
+      researchAppCategoryMap.append((app: arguments[appIndex], category: arguments[categoryIndex]))
+      index = arguments.index(after: categoryIndex)
+      continue
+    }
+
+    error("Unknown argument: \(argument)")
+    exit(1)
+  }
+}
+
+func titleShouldBeExcluded(_ title: String) -> Bool {
+  let range = NSRange(title.startIndex..<title.endIndex, in: title)
+  return excludeTitlePatterns.contains { pattern in
+    pattern.firstMatch(in: title, options: [], range: range) != nil
+  }
+}
+
+func isResearchBrowser(_ app: String) -> Bool {
+  return researchBrowserApps.contains(app.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+}
+
+// Return the category of the *longest* pattern contained in `haystack`.
+// Longest-match beats map order because study maps routinely contain both a
+// generic and a specific form of the same host ("google.com" vs
+// "docs.google.com"); first-match-wins would file every Google Docs/Drive/
+// Calendar/Meet URL under the generic entry. Ties resolve to map order.
+// Twin of `_longest_match` in research_filter.py — keep the two in sync.
+func longestResearchMatch(_ haystack: String) -> String? {
+  var bestCategory: String?
+  var bestLength = -1
+  for item in researchCategoryMap {
+    if item.pattern.isEmpty { continue }
+    // Compare by Unicode scalar count, not Character count: Swift's `count`
+    // measures grapheme clusters while Python's `len()` measures code points,
+    // which would let the two twins pick different winners for non-ASCII
+    // patterns of equal visual length.
+    let patternLength = item.pattern.unicodeScalars.count
+    if haystack.range(of: item.pattern, options: [.caseInsensitive]) != nil,
+      patternLength > bestLength
+    {
+      bestCategory = item.category
+      bestLength = patternLength
+    }
+  }
+  return bestCategory
+}
+
+func classifyResearch(_ title: String, url: String?) -> String {
+  // Try URL first — more reliable than page title, which can change mid-load
+  if let url = url, !url.isEmpty {
+    if let category = longestResearchMatch(url) {
+      return category
+    }
+  }
+  if let category = longestResearchMatch(title) {
+    return category
+  }
+  return "excluded"
+}
+
+func classifyApp(_ app: String) -> String {
+  // Case-insensitive exact lookup of app name in the app category map.
+  // Returns the mapped category, or "Excluded" when the app is not in the map.
+  // Both sides are trimmed and lowercased so a configured key carrying stray
+  // whitespace matches identically here and in the Python path
+  // (research_filter.classify_app). Without trimming the configured key, a map
+  // entry like " Microsoft Outlook" would classify on Linux/Windows but fall
+  // through to "Excluded" on the macOS Swift path for the same config.
+  let appLower = app.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+  for item in researchAppCategoryMap {
+    if item.app.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == appLower {
+      return item.category
+    }
+  }
+  return "Excluded"
+}
+
+func applyResearchFilter(_ data: NetworkMessage) -> NetworkMessage {
+  if !researchEnabled {
+    return data
+  }
+
+  if isResearchBrowser(data.app) {
+    return NetworkMessage(app: data.app, title: classifyResearch(data.title ?? "", url: data.url), url: nil)
+  }
+
+  // Non-browser: map app to study category when a map is provided;
+  // otherwise keep app name and drop title (legacy behaviour).
+  if researchAppCategoryMap.isEmpty {
+    return NetworkMessage(app: data.app, title: nil, url: nil)
+  }
+  // Replace the raw app identity with its category — the app name is the
+  // sensitive identifier for non-browser apps, so it must not be retained.
+  return NetworkMessage(app: classifyApp(data.app), title: nil, url: nil)
+}
+
+func start() {
+  // Arguments should be:
+  //  - url + port
+  //  - bucket_id
+  //  - hostname
+  //  - client_id
+  let arguments = CommandLine.arguments
+
+  // Check that we get the 4 required arguments plus any optional flags
+  if arguments.count < 5 {
+    print("Usage: aw-watcher-window <url> <bucket> <hostname> <client> [--exclude-title] [--exclude-titles <pattern> ...] [--research] [--research-category <pattern> <category> ...] [--research-app-category <app_name> <category> ...]")
+    exit(1)
+  }
+
+  baseurl = arguments[1]
+  bucketName = arguments[2]
+  clientHostname = arguments[3]
+  clientName = arguments[4]
+  parseOptionalArguments(arguments.dropFirst(5))
+
+  guard checkAccess() else {
+    DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+      start()
+    }
+    return
+  }
+
+  createBucket()
+
+  // listen for changes in focused application
+  NSWorkspace.shared.notificationCenter.addObserver(
+    main,
+    selector: #selector(main.focusedAppChanged),
+    name: NSWorkspace.didActivateApplicationNotification,
+    object: nil
+  )
+
+  main.focusedAppChanged()
+
+  // Start the polling timer
+  main.pollingTimer = Timer.scheduledTimer(timeInterval: 10.0, target: main, selector: #selector(main.pollActiveWindow), userInfo: nil, repeats: true)
+}
+
+// TODO might be better to have the python wrapper create this before launching the swift application
+func createBucket() {
+  let payload = try! encoder.encode(
+    Bucket(client: clientName, type: "currentwindow", hostname: clientHostname))
+
+  let url = URL(string: "\(baseurl)/api/0/buckets/\(bucketName)")!
+  Task {
+    var urlRequest = URLRequest(url: url)
+    urlRequest.httpMethod = "POST"
+    urlRequest.addValue("application/json", forHTTPHeaderField: "Content-Type")
+    let (_, response) = try await URLSession.shared.upload(for: urlRequest, from: payload)
+    guard (200...299).contains((response as! HTTPURLResponse).statusCode) else {
+      log("Failed to create bucket")
+      return
+    }
+  }
+}
+
+func sendHeartbeat(_ heartbeat: Heartbeat) {
+  let oldPayloadDifferent = oldHeartbeat != nil && oldHeartbeat!.data != heartbeat.data
+  let timeSinceLastHeartbeat = oldHeartbeat != nil ? heartbeat.timestamp.timeIntervalSince(oldHeartbeat!.timestamp) : -1.0
+
+  // if you resize a window a ton of events (subsecond) will be fired
+  // we enforce a 1s minimum gap between events to avoid this
+  if timeSinceLastHeartbeat != -1.0 && timeSinceLastHeartbeat <= 0.5 {
+    debug("skipping heartbeat, last heartbeat was sent 1s ago")
+    return
+  }
+
+  // TODO running these async could cause weird state issues since the observer stuff can send a log of heartbeats
+  //      in a short time under certain circumstances, and we don't want to send them all
+  Task {
+    if oldPayloadDifferent {
+      debug("sending old heartbeat for merging")
+
+      do {
+        // unlike the python aw-client library, we do not enforce a `commit_interval` and instead send the old event (which is not invalid)
+        // at the current time with a pulse value equal to the time since this event was originally sent. The aw-server will then merge
+        // this new event with the original event, extending the recorded time spent on this particular window/application.
+
+        let refreshedOldHeartbeat = Heartbeat(
+          // it is important to refresh the hearbeat using the timestamp where the user stopped working on the previous application
+          // more info: https://github.com/ActivityWatch/aw-watcher-window/pull/69
+          // we don't *think* this millisecond subtraction is necessary, but it may be:
+          // https://github.com/ActivityWatch/aw-watcher-window/pull/69#discussion_r987064282
+          timestamp: heartbeat.timestamp - 0.001,
+          data: oldHeartbeat!.data
+        )
+
+        try await sendHeartbeatSingle(refreshedOldHeartbeat, pulsetime: timeSinceLastHeartbeat + 1)
+      } catch {
+        log("Failed to send old heartbeat: \(error)")
+        return
+      }
+    }
+
+    do {
+      let since_last_seconds = oldHeartbeat != nil ? heartbeat.timestamp.timeIntervalSince(oldHeartbeat!.timestamp) : 0
+      try await sendHeartbeatSingle(heartbeat, pulsetime: since_last_seconds + 1)
+    } catch {
+      log("Failed to send heartbeat: \(error)")
+      return
+    }
+
+    oldHeartbeat = heartbeat
+  }
+}
+
+func sendHeartbeatSingle(_ heartbeat: Heartbeat, pulsetime: Double) async throws {
+  let url = URL(string: "\(baseurl)/api/0/buckets/\(bucketName)/heartbeat?pulsetime=\(pulsetime)")!
+
+  var urlRequest = URLRequest(url: url)
+  urlRequest.httpMethod = "POST"
+  urlRequest.addValue("application/json", forHTTPHeaderField: "Content-Type")
+
+  let payload = try! encoder.encode(heartbeat)
+  let (_, response) = try await URLSession.shared.upload(for: urlRequest, from: payload)
+
+  guard (200...299).contains((response as! HTTPURLResponse).statusCode) else {
+    throw HeartbeatError.error(msg: "Failed to send heartbeat: \(response)")
+  }
+
+  debug("[heartbeat] bucket: \(bucketName), timestamp: \(heartbeat.timestamp), pulsetime: \(round(pulsetime * 10) / 10), app: \(heartbeat.data.app), title: \(heartbeat.data.title ?? ""), url: \(heartbeat.data.url ?? "")")
+}
+
+class MainThing {
+  var observer: AXObserver?
+  var oldWindow: AXUIElement?
+  var pollingTimer: Timer?
+
+  // list of chrome equivalent browsers
+  let CHROME_BROWSERS = [
+    "Google Chrome",
+    "Google Chrome Canary",
+    "Chromium",
+    "Brave Browser",
+  ]
+
+  // Gecko-based browsers have no scripting interface for tabs, but expose the
+  // current page URL on their accessibility tree's AXWebArea node
+  let FIREFOX_BROWSERS = [
+    "Firefox",
+    "Firefox Developer Edition",
+    "Firefox Nightly",
+    "Zen",
+    "Zen Browser",
+    "LibreWolf",
+    "Waterfox",
+    "Floorp",
+  ]
+
+  // upper bound on accessibility elements examined per lookup, so a
+  // pathological tree can't stall the watcher (the web area is typically
+  // found within a few dozen elements)
+  let AX_TRAVERSAL_LIMIT = 384
+
+  // Search the window's accessibility tree breadth-first for an AXWebArea node
+  // and return its AXURL, the URL of the loaded page. The top-level document's
+  // web area sits shallow in Gecko's tree and is reached before any web areas
+  // of nested iframes, so the first hit is the current page.
+  // (there is no kAXWebAreaRole constant in HIServices; the role string is
+  // defined by the browsers themselves)
+  func geckoURL(window: AXUIElement) -> String? {
+    var queue: [AXUIElement] = [window]
+    var index = 0
+    while index < queue.count && index < AX_TRAVERSAL_LIMIT {
+      let element = queue[index]
+      index += 1
+
+      var roleRef: AnyObject?
+      AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef)
+      if roleRef as? String == "AXWebArea" {
+        var urlRef: AnyObject?
+        AXUIElementCopyAttributeValue(element, kAXURLAttribute as CFString, &urlRef)
+        if let url = urlRef as? NSURL {
+          return url.absoluteString
+        }
+        // no URL on the web area (e.g. page still loading); stop rather than
+        // keep searching, since a deeper hit would be an iframe's web area
+        return urlRef as? String
+      }
+
+      var childrenRef: AnyObject?
+      AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef)
+      if let children = childrenRef as? [AXUIElement] {
+        queue.append(contentsOf: children)
+      }
+    }
+    return nil
+  }
+
+  @objc func pollActiveWindow() {
+    debug("Polling active window")
+
+    guard let frontmost = NSWorkspace.shared.frontmostApplication else {
+      log("Failed to get frontmost application from polling")
+      return
+    }
+
+    let pid = frontmost.processIdentifier
+    let focusedApp = AXUIElementCreateApplication(pid)
+
+    var focusedWindow: AnyObject?
+    AXUIElementCopyAttributeValue(focusedApp, kAXFocusedWindowAttribute as CFString, &focusedWindow)
+
+    if focusedWindow != nil {
+      focusedWindowChanged(observer!, window: focusedWindow as! AXUIElement)
+    }
+  }
+
+  deinit {
+    pollingTimer?.invalidate()
+  }
+
+  func windowTitleChanged(
+    _ axObserver: AXObserver,
+    axElement: AXUIElement,
+    notification: CFString
+  ) {
+    guard let frontmost = NSWorkspace.shared.frontmostApplication else {
+      log("Failed to get frontmost application from window title notification")
+      return
+    }
+
+    // calculate now before executing any scripting since that can take some time
+    let nowTime = Date.now
+
+    var windowTitle: AnyObject?
+    AXUIElementCopyAttributeValue(axElement, kAXTitleAttribute as CFString, &windowTitle)
+
+    let applicationName = frontmost.localizedName ?? frontmost.bundleIdentifier ?? ""
+    var data = NetworkMessage(app: applicationName, title: windowTitle as? String ?? "")
+
+    if CHROME_BROWSERS.contains(applicationName) {
+      debug("Chrome browser detected, extracting URL and title")
+
+      guard let bundleIdentifier = frontmost.bundleIdentifier else {
+        log("Failed to get bundle identifier from frontmost application, which was recognized to be Chrome")
+        return
+      }
+      let chromeObject: ChromeProtocol = SBApplication.init(bundleIdentifier: bundleIdentifier)!
+
+      guard let windows = chromeObject.windows,
+            let frontWindow = windows().first else {
+        log("Failed to get chrome front window")
+        return
+      }
+      guard let activeTab = frontWindow.activeTab else {
+        log("Failed to get chrome active tab")
+        return
+      }
+
+      if frontWindow.mode == "incognito" {
+        data = NetworkMessage(app: "", title: "")
+      } else {
+        data.url = activeTab.URL
+
+        // the tab title is more accurate and often different than the window title
+        // however, in some cases the binary does not have the right permissions to read
+        // the title properly and will return a blank string
+
+        if let tabTitle = activeTab.title {
+          if(tabTitle != "" && data.title != tabTitle) {
+            error("tab title diff: \(tabTitle), window title: \(data.title)")
+            data.title = tabTitle
+          }
+        }
+      }
+    } else if frontmost.localizedName == "Safari" {
+      debug("Safari browser detected, extracting URL and title")
+
+      guard let bundleIdentifier = frontmost.bundleIdentifier else {
+        log("Failed to get bundle identifier from frontmost application, which was recognized to be Safari")
+        return
+      }
+      let safariObject: SafariApplication = SBApplication.init(bundleIdentifier: bundleIdentifier)!
+
+      guard let windows = safariObject.windows,
+            let frontWindow = windows().first else {
+        log("Failed to get safari front window")
+        return
+      }
+      guard let activeTab = frontWindow.currentTab else {
+        log("Failed to get safari active tab")
+        return
+      }
+
+      // Safari doesn't allow incognito mode to be inspected, so we do not know if we should hide the url
+      data.url = activeTab.URL
+
+      // comment above applies here as well
+      if let tabTitle = activeTab.name {
+        if tabTitle != "" && data.title != tabTitle {
+          error("tab title diff: \(tabTitle), window title: \(data.title)")
+          data.title = tabTitle
+        }
+      }
+    } else if FIREFOX_BROWSERS.contains(applicationName) {
+      debug("Firefox-based browser detected, extracting URL from accessibility tree")
+
+      // note: private windows are not hidden here (unlike the Chrome incognito
+      // branch) — Gecko does not mark them in the accessibility tree, and their
+      // window titles carry a "Private Browsing" suffix for rules to match
+      data.url = geckoURL(window: axElement)
+
+      if data.url == nil {
+        // Newer Gecko builds instantiate their accessibility engine lazily and
+        // no longer treat plain tree walks as an assistive client, leaving the
+        // window's AX tree without any web content. Requesting
+        // AXEnhancedUserInterface (as VoiceOver does) turns the engine on; the
+        // call may report an error while the engine spins up, but the tree is
+        // populated for subsequent polls and stays on for the browser session.
+        let axApp = AXUIElementCreateApplication(frontmost.processIdentifier)
+        AXUIElementSetAttributeValue(axApp, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+      }
+    }
+
+    if researchEnabled {
+      data = applyResearchFilter(data)
+    } else if excludeTitle || titleShouldBeExcluded(data.title ?? "") {
+      data.title = "excluded"
+      // the URL identifies the page at least as precisely as the title does,
+      // so an excluded window must not report it either
+      data.url = nil
+    }
+
+    let heartbeat = Heartbeat(timestamp: nowTime, data: data)
+    sendHeartbeat(heartbeat)
+  }
+
+  @objc func focusedWindowChanged(_ observer: AXObserver, window: AXUIElement) {
+    debug("Focused window changed")
+
+    if oldWindow != nil {
+      AXObserverRemoveNotification(observer, oldWindow!, kAXFocusedWindowChangedNotification as CFString)
+    }
+
+    let selfPtr = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+    AXObserverAddNotification(observer, window, kAXTitleChangedNotification as CFString, selfPtr)
+
+    windowTitleChanged(
+      observer, axElement: window, notification: kAXTitleChangedNotification as CFString)
+
+    oldWindow = window
+  }
+
+  @objc func focusedAppChanged() {
+    debug("Focused app changed")
+
+    if observer != nil {
+      CFRunLoopRemoveSource(
+        RunLoop.current.getCFRunLoop(),
+        AXObserverGetRunLoopSource(observer!),
+        CFRunLoopMode.defaultMode
+      )
+    }
+
+    guard let frontmost = NSWorkspace.shared.frontmostApplication else {
+      log("Failed to get frontmost application from app change notification")
+      return
+    }
+
+    let pid = frontmost.processIdentifier
+    let focusedApp = AXUIElementCreateApplication(pid)
+
+    AXObserverCreate(
+      pid,
+      {
+        (
+          _ axObserver: AXObserver,
+          axElement: AXUIElement,
+          notification: CFString,
+          userData: UnsafeMutableRawPointer?
+        ) -> Void in
+        guard let userData = userData else {
+          log("Missing userData")
+          return
+        }
+        let application = Unmanaged<MainThing>.fromOpaque(userData).takeUnretainedValue()
+        if notification == kAXFocusedWindowChangedNotification as CFString {
+          application.focusedWindowChanged(axObserver, window: axElement)
+        } else {
+          application.windowTitleChanged(
+            axObserver,
+            axElement: axElement,
+            notification: notification
+          )
+        }
+      }, &observer)
+
+    let selfPtr = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+    AXObserverAddNotification(observer!, focusedApp, kAXFocusedWindowChangedNotification as CFString, selfPtr)
+
+    CFRunLoopAddSource(
+      RunLoop.current.getCFRunLoop(),
+      AXObserverGetRunLoopSource(observer!),
+      CFRunLoopMode.defaultMode
+    )
+
+    var focusedWindow: AnyObject?
+    AXUIElementCopyAttributeValue(focusedApp, kAXFocusedWindowAttribute as CFString, &focusedWindow)
+
+    if focusedWindow != nil {
+      focusedWindowChanged(observer!, window: focusedWindow as! AXUIElement)
+    }
+  }
+}
+
+// TODO I believe this is handled by the python wrapper so it isn't needed here
+func checkAccess() -> Bool {
+  let checkOptPrompt = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as NSString
+  let options = [checkOptPrompt: true]
+  let accessEnabled = AXIsProcessTrustedWithOptions(options as CFDictionary?)
+  return accessEnabled
+}

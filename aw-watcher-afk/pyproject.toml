@@ -1,0 +1,35 @@
+[tool.poetry]
+name = "aw-watcher-afk"
+version = "0.2.0"
+description = "AFK watcher for ActivityWatch"
+authors = ["Erik Bjäreholt <erik@bjareho.lt>"]
+license = "MPL-2.0"
+
+[tool.poetry.scripts]
+aw-watcher-afk = "aw_watcher_afk:main"
+
+[tool.poetry.dependencies]
+python = "^3.8"
+aw-client = "^0.5.14"
+pyobjc-framework-Quartz = { version = "*", platform = "darwin" }
+pynput = "*"
+
+# locked due to https://github.com/python-xlib/python-xlib/pull/242 leading to 100% CPU stalls
+# see: https://github.com/ActivityWatch/aw-watcher-window/issues/89
+python-xlib = { version = "0.31", platform = "linux" }
+
+# Optional: gamepad/joystick support via evdev (Linux only)
+# Install with: pip install evdev  (or: pip install aw-watcher-afk[gamepad])
+evdev = { version = ">=1.4", platform = "linux", optional = true }
+
+[tool.poetry.extras]
+gamepad = ["evdev"]
+
+[tool.poetry.dev-dependencies]
+mypy = "*"
+macholib = {version = "*", platform = "darwin"}
+pyinstaller = {version = "^6.6", python = "^3.8,<3.14"}
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
